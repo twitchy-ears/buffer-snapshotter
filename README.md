@@ -44,6 +44,11 @@ like this:
     (add-hook 'atomic-chrome-edit-mode-hook
                (lambda () (buffer-snapshotter-mode 1)))
 
+If you want it to automatically run globally for every buffer then use something like this (by default it will refuse to run in minibuffer mode or any file accessed via EasyPG Assistant):
+
+    (add-hook 'after-change-major-mode-hook #'buffer-snapshotter-mode)
+
+
 ## Configuring buffer-snapshotter-mode
 
 Interesting variables to play around with and read the docstrings of include:
@@ -56,6 +61,8 @@ Interesting variables to play around with and read the docstrings of include:
 * `buffer-snapshotter-force-frequency` seconds of time before checking to see if a snapshot is worth taking idle or not, defaults to 600s (10 minutes).
 * `buffer-snapshotter-namegen-function` should be a `#'function-symbol` to a function used to generate consistent and filesystem safe names for snapshot files, the default replaces characters with their codepoint numbers for everything not matching `[a-zA-Z0-9_-]`
 * `buffer-snapshotter-include-hostname` if snapshotting a buffer this will include the hostname into the name generation by default, this is to help distinguish between similarly named buffers on different machines if you synchronise your Emacs directory.  If you want to turn off this behaviour so that different machines can see the same snapshots linked to the same named buffers then set this to `nil`.
+* `buffer-snapshotter-never-activate-mode-list` list of modes (both major and minor) that if active in a buffer will cause it to not activate.
+* `buffer-snapshotter-never-activate-function` function that if it returns t will cause it to not activate.
 
 There are also two hooks to append to:
 

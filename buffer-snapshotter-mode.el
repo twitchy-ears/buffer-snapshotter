@@ -48,6 +48,10 @@
 ;;
 ;; (add-hook 'atomic-chrome-edit-mode-hook
 ;;            (lambda () (buffer-snapshotter-mode 1)))
+;;
+;; If you want to activate it globally then use something like this: 
+;;
+;; (add-hook 'after-change-major-mode-hook #'buffer-snapshotter-mode)
 
 ;; TODO:
 ;;
@@ -56,6 +60,7 @@
 ;;; Code:
 
 (eval-and-compile
+  (require 'seq)
   (with-no-warnings (require 'cl-lib)))
 
 ;; Local variables
@@ -117,9 +122,27 @@ own decisions")
 
 (defvar buffer-snapshotter--string-safe-pattern "[a-zA-Z0-9_-]" "The pattern used by buffer-snapshotter--string-safe, everything not matching this will be replaced by numeric codepoint versions when constructing the names of snapshot files")
 
+(defvar buffer-snapshotter-never-activate-mode-list
+  '(minibuffer-mode)
+  "List of modes to never activate buffer-snapshotter-mode in, is checked
+against both 'major-mode' and 'local-minor-modes', defaults to avoiding the minibuffer.")
+
+(defvar buffer-snapshotter-never-activate-function
+  #'buffer-snapshotter-never-activate-function-p
+  "Function that runs before the mode is activated, if it returns t then the mode will not be activated.")
 
 
 ;;--- Functions ---
+
+(defun buffer-snapshotter-never-activate-function-p ()
+  "Runs in the current buffer as part of 'buffer-snapshot-mode' if
+it returns t then the mode will not activate for this buffer.
+
+By default checks to see if we're an encrypted file using (epa-file-name-p)
+and returns t for this case."
+  (let ((bfname (buffer-file-name)))
+    (if bfname
+        (epa-file-name-p bfname))))
 
 (defun buffer-snapshotter--string-safe (str)
   "Takes a string 'STR' and renders everything not matching the
@@ -372,7 +395,47 @@ anything yourself."
             ;; Run any user hooks
             (run-hooks 'buffer-snapshotter-save-copy-after-hook)
             bs-filename)))))) ;; return the filename on success
-                                
+
+(defun buffer-snapshotter--mode-activate-check-p ()
+  "Returns t if buffer-snapshotter-mode should activate and nil
+if it should not.  If 'buffer-snapshotter-notify' is t then it
+also outputs helpful messages.
+
+Makes use of the 'buffer-snapshotter-never-activate-mode-list' as well
+as the 'buffer-snapshotter-never-activate-function' variables."
+  (cond
+   ;; Check major mode 
+   ((seq-contains-p buffer-snapshotter-never-activate-mode-list
+                    major-mode)
+    (if buffer-snapshotter-notify
+        (message "Cannot activate buffer-snapshotter-mode in '%s' because '%s' is in the buffer-snapshotter-never-activate-mode-list"
+                 (buffer-name)
+                 major-mode))
+    nil)
+
+   ;; Check minor modes
+   ((let ((is (seq-intersection buffer-snapshotter-never-activate-mode-list
+                                local-minor-modes)))
+      (when is
+        (if buffer-snapshotter-nofify
+            (message "Cannot activate buffer-snapshotter-mode in '%s' because '%s' is in the buffer-snapshotter-never-activate-mode-list"
+                     (buffer-name)
+                     is))
+        nil)))
+
+   ;; Check predicate function
+   ((when (and (fboundp buffer-snapshotter-never-activate-function)
+               (funcall buffer-snapshotter-never-activate-function))
+      (if buffer-snapshotter-notify         
+          (message "Cannot activate buffer-snapshotter-mode in '%s' because '%s' returned t"
+                   (buffer-name)
+                   buffer-snapshotter-never-activate-function))
+      nil))
+
+   ;; Default case actually works.
+   (t t)))
+
+
 (define-minor-mode buffer-snapshotter-mode ()
   "When enabled snapshots a buffer regularly into a directory by
 timestamp, keeping only the last N snapshot files or removing
@@ -381,10 +444,16 @@ snapshot files older than a specific date decided by the
 'buffer-snapshotter-save-copy' function for the entry point to
 most of the work.
 
+Checks the variable 'buffer-snapshotter-never-activate-mode-list' and refuses to activate if any of the modes in this list are in the major-mode or local-minor-modes variables.
+
 Can work on temporary buffers or buffers visiting files.
 
 Has a 'buffer-snapshotter-mode-after-hook' which occurs after it is
- activated/deactivated."
+ activated/deactivated.
+
+If you want to activate it globally then add it to
+'after-change-major-mode-hook' with something like this:
+(add-hook 'after-change-major-mode-hook #'buffer-snapshotter-mode)"
   :init-value nil
   :global nil
   :lighter "bs"
@@ -393,7 +462,8 @@ Has a 'buffer-snapshotter-mode-after-hook' which occurs after it is
   (if buffer-snapshotter-mode
 
       ;; Turn on
-      (progn
+      (when (buffer-snapshotter--mode-activate-check-p)
+        
         ;; Kill existing timer(s)
         (if buffer-snapshotter-timer
             (cancel-timer buffer-snapshotter-timer))
