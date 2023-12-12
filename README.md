@@ -36,6 +36,6 @@ Interesting variables to play around with and read the docstrings of include:
 * `buffer-snapshotter-cleanup-method` allows you to pick cleanup method, it defaults to `#'buffer-snapshotter-delete-excess-by-number` which keeps N versions of each files snapshots at most, set to `#'buffer-snapshotter-delete-excess-by-time` if you want to keep snapshots for a specific amount of time, or create your own function.
 * `buffer-snapshotter-keep-versions` numbers of versions to keep if keeping by number
 * `buffer-snapshotter-keep-time` seconds to keep a snapshot, defaults to 21600 so 6 hours.
-* `buffer-snapshotter-keep-time` seconds of idle time before checking to see if a snapshot is worth taking, defaults to 30s.
+* `buffer-snapshotter-frequency` seconds of idle time before checking to see if a snapshot is worth taking, defaults to 30s.
 * `buffer-snapshotter-force-frequency` seconds of time before checking to see if a snapshot is worth taking idle or not, defaults to 600s (10 minutes).
 * `buffer-snapshotter-namegen-func` should be a `#'function-symbol` to a function used to generate consistent and filesystem safe names for snapshot files, the default replaces characters with their codepoint numbers for everything not matching `[a-zA-Z0-9_-]`
