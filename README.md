@@ -13,7 +13,7 @@ Essentially all you need is this:
 
     (use-package buffer-snapshot)
 
-Then `M-x (buffer-snapshotter)` in a buffer you feel needs this mode.
+Then `M-x buffer-snapshotter` in a buffer you feel needs this mode.
 
 If you want it to clean up old snapshot files whenever you start Emacs then
 try something like this:
