@@ -28,6 +28,9 @@
 ;;; History
 ;;
 ;; 2023-12-11 Initial version.
+;;
+;; 2026-10-23 Added diff functions and started to put thoughts into
+;;            more elegant directory cleaning.
 
 ;;; Commentary:
 
@@ -56,11 +59,14 @@
 ;; TODO:
 ;;
 ;; Generally more testing.
+;; 
+;; Add variable for always keeping N copies of a document during cleanup.
 
 ;;; Code:
 
 (eval-and-compile
   (require 'seq)
+  (require 'files)
   (with-no-warnings (require 'cl-lib)))
 
 ;; Local variables
@@ -88,14 +94,14 @@ distinguished between machines if you are synchronising your
 directories")
 
 (defvar buffer-snapshotter-directory
-    (expand-file-name (format "%s/%s"
-                              user-emacs-directory
-                              "buffer-snapshots"))
+  (expand-file-name (format "%s/%s"
+                            user-emacs-directory
+                            "buffer-snapshots"))
   "Stores location of buffer snapshots")
 
 (defvar buffer-snapshotter-namegen-function
-    #'buffer-snapshotter--default-namegen-func
- "Function used to generate snapshot filename bases which will have
+  #'buffer-snapshotter--default-namegen-func
+  "Function used to generate snapshot filename bases which will have
 timestamps appended, also used to find files to clean up so
 if you change it you may leave a mess behind that needs
 cleaning manually.")
@@ -106,15 +112,26 @@ cleaning manually.")
 
 (defvar buffer-snapshotter-cleanup-method-function
   #'buffer-snapshotter-delete-excess-by-number
-  "Method of cleaning up excess snapshot files, defaults to
-'buffer-snapshotter-delete-excess-by-number' for using
+  "Cleans snapshot files while working to keep only a certain amount around.
+
+Defaults to 'buffer-snapshotter-delete-excess-by-number' for using
 'buffer-snapshotter-keep-versions' to determine how many to keep,
 if you set it to 'buffer-snapshotter-delete-excess-by-time' it
 will use 'buffer-snapshotter-keep-time' to determine which to
 delete.  If you point it to your own function you can make your
-own decisions")
+own decisions.
 
-(defvar buffer-snapshotter-maximum-age 259200 "Maximum age for a snapshot file to be valid, can be used for a general purpose directory cleanup")
+Similarly named function `buffer-snapshotter-cleanup-directory' is a
+function you can run on emacs startup to do a general sweep of snapshots,
+this is time based and configured seperately.")
+
+(defvar buffer-snapshotter-cleanup-directory-age 259200 "Age in seconds for a snapshot file to be kept, used by buffer-snapshotter-cleanup-directory to remove older files, default 3 days")
+
+;; TODO: Rework the snapshotter cleanup stuff to keep a last copy longer.
+
+;; (defvar buffer-snapshotter-cleanup-directory-keep-snapshots 1 "How many snapshots over the maximum age to keep around, used by buffer-snapshotter-cleanup-directory")
+
+;; (defvar buffer-snapshotter-cleanup-directory-maximum-age 1814400 "Age in seconds for the retained snapshots to be kept, used by buffer-snapshotter-cleanup-directory")
 
 (defvar buffer-snapshotter-mode-after-hook nil "Hook that runs after the mode is turned on or off")
 
@@ -164,9 +181,9 @@ returns the composite string"
                                     strchar)
                     strchar
                   char)))
-                        ;(or (get-char-property (point) 'untranslated-utf-8)
-                        ;    (encode-char (char-after) 'ucs)
-                        ;    (following-char)))))
+                                        ;(or (get-char-property (point) 'untranslated-utf-8)
+                                        ;    (encode-char (char-after) 'ucs)
+                                        ;    (following-char)))))
           (setq res (cons final res))
           (forward-char 1)))
 
@@ -210,51 +227,172 @@ a dot, then a numeric timestamp."
                         buffer-snapshotter-base-name))
          (snap-list  (directory-files buffer-snapshotter-directory
                                       t
-                                      (format "%s.[0-9]*$" bs-basename))))
+                                      (format "%s.[0-9]*$" bs-basename)
+                                      nil)))
     snap-list))
+
+(defun buffer-snapshotter-get-nth-from-last-snapshot (&optional countback force-name)
+  "Retreives a snapshot file for the current buffer counting back from latest
+
+if FORCE-NAME is given that is used to generate the buffer snapshot list
+
+if COUNTBACK is given that is used to count back from the end of the list, defaults to 0"
+  (if (not countback)
+      (setq countback 0))
+  
+  ;; They should come sorted by name which includes the epoch so get
+  ;; the nth one, where zero is the last one so default to that.
+  (nth countback (nreverse (buffer-snapshotter--get-snapshot-list force-name))))
+
+(defun buffer-snapshotter-diff-buffer-last-snapshot (&optional countback force-name)
+  "Displays a diff between the current buffer and its last snapshot file.
+
+If COUNTBACK is given (or the universal argument given) will go back that many snapshots and do the diff.
+If both the prefix argument and countback are supplied will prefer the argument.
+
+If FORCE-NAME is given will use that to generate the name for searching for snapshots."
+  (interactive)
+
+  ;; Bail if the modes not running because if its not we can't get the list of names etc.
+  (unless buffer-snapshotter-mode
+    (if (called-interactively-p 'any)
+        (message "buffer-snapshotter-mode not running"))
+    (error "buffer-snapshotter-mode not running"))
+
+  ;; If we have a countback that's an int then use it, otherwise check
+  ;; the current-prefix-arg which is set via C-u, otherwise use zero.
+  (unless (and (boundp 'countback)
+               (cl-typep countback 'integer)
+               (>= countback 0))
+    (if (and (boundp 'current-prefix-arg)
+             (cl-typep current-prefix-arg 'integer)
+             (>= current-prefix-arg 0))
+        (setq countback current-prefix-arg)
+      (setq countback 0)))        
+  
+  (let ((last-snapshot (expand-file-name (buffer-snapshotter-get-nth-from-last-snapshot countback force-name))))
+    (when (file-exists-p last-snapshot)
+      (diff last-snapshot (current-buffer) nil 'noasync))))
+
+(defun buffer-snapshotter-vdiff-buffer-last-snapshot (&optional countback force-name)
+  "Displays a vdiff between the current buffer and its last snapshot file.
+
+If COUNTBACK is given (or the universal argument given) will go back that many snapshots and do the diff.
+If both the prefix argument and countback are supplied will prefer the argument.
+
+If FORCE-NAME is given will use that to generate the name for searching for snapshots."
+  (interactive)
+
+  ;; Bail if the modes not running because if its not we can't get the list of names etc.
+  (unless buffer-snapshotter-mode
+    (if (called-interactively-p 'any)
+        (message "buffer-snapshotter-mode not running"))
+    (error "buffer-snapshotter-mode not running"))
+
+  (unless (fboundp 'vdiff-buffers)
+    (if (called-interactively-p 'any)
+        (message "vdiff-buffers not available"))
+    (error "vdiff-buffers not available"))
+
+  ;; If we have a countback that's an int then use it, otherwise check
+  ;; the current-prefix-arg which is set via C-u, otherwise use zero.
+  (unless (and (boundp 'countback)
+               (cl-typep countback 'integer)
+               (>= countback 0))
+    (if (and (boundp 'current-prefix-arg)
+             (cl-typep current-prefix-arg 'integer)
+             (>= current-prefix-arg 0))
+        (setq countback current-prefix-arg)
+      (setq countback 0)))        
+
+  (let* ((last-snapshot (expand-file-name
+                         (buffer-snapshotter-get-nth-from-last-snapshot
+                          countback force-name)))
+         (active-buffer (current-buffer))
+         (ss-buffer nil))
+    
+    (when (file-exists-p last-snapshot)
+
+      ;; Name the buffer after the epoch in the filename if we find one
+      (let* ((ss-epoch (file-name-extension last-snapshot))
+             (ss-suffix (if ss-epoch
+                            ss-epoch
+                          "0")))
+        
+        ;; Dump the snapshot into a temporary buffer
+        (setq ss-buffer
+              (get-buffer-create
+               (format "*buffer-snapshotter-mode-vdiff-buffer-last-snapshot-%s*" ss-suffix)))
+
+        (save-excursion
+          (switch-to-buffer ss-buffer)
+          (goto-char (point-min))
+          (insert-file last-snapshot))
+        
+        ;; Vdiff the buffers, but also put in a function to kill the temporary buffer upon use of vdiff-quit
+        (vdiff-buffers active-buffer
+                       ss-buffer
+                       t
+                       (lambda (actual-buff ss-buff)
+                         (kill-buffer ss-buff))
+                       t
+                       nil)))))
+
 
 (defun buffer-snapshotter-cleanup-directory (&optional force-dir)
   "Runs through every file in the 'buffer-snapshotter-directory' and
 deletes every file with an mtime older in seconds than
-'buffer-snapshotter-keep-time' chases down symlinks as well.
+'buffer-snapshotter-cleanup-directory-age' chases down symlinks as well.
 
 If FORCE-DIR is given then it will use this directory instead of
 'buffer-snapshotter-directory', this can obviously be
 dangerous."
   (interactive)
-  (when (or (not (boundp 'buffer-snapshotter-maximum-age))
-            (not (numberp buffer-snapshotter-maximum-age))
-            (not (>= buffer-snapshotter-maximum-age 1)))
+  (unless (and (boundp 'buffer-snapshotter-cleanup-directory-age)
+               (cl-typep buffer-snapshotter-cleanup-directory-age 'integer)
+               (>= buffer-snapshotter-cleanup-directory-age 1))
     (error "buffer-snapshotter-cleanup-directory: buffer-snapshotter-maximum-age seems in error should be a number > 1"))
-  
-  (let* ((target-dir (if force-dir
-                         force-dir
-                       buffer-snapshotter-directory))
-         (whole-list (directory-files target-dir t))
-         (now (string-to-number (format-time-string "%s" (current-time))))
-         (oldest (- now buffer-snapshotter-maximum-age)))
 
-    ;; Run through the list.
-    (dolist (target whole-list)
+  (let ((target-dir (if force-dir
+                        force-dir
+                      buffer-snapshotter-directory)))
+
+    (unless (file-exists-p target-dir)
+      (error "buffer-snapshotter-cleanup-directory: directory doesn't exist '%s' will likely be created the first time you activate the mode"
+             target-dir))
+
+    (unless (file-accessible-directory-p target-dir)
+      (error "buffer-snapshotter-cleanup-directory: directory isn't accessible '%s' you may need to fix the permissions."
+             target-dir))
+
+    (let* ((whole-list (directory-files target-dir t nil t))
+           (now (string-to-number (format-time-string "%s" (current-time))))
+           (oldest (- now buffer-snapshotter-cleanup-directory-age)))
       
-      ;; Calculate the mtime of the file-truename to get the real path
-      ;; and chase down symlinks and so forth and make sure to convert
-      ;; it back into a number.  There is probably a better way to do
-      ;; this I may be wasting my time with one of the conversions.
-      (let ((mtime (string-to-number
-                    (format-time-string
-                     "%s"
-                     (file-attribute-modification-time
-                      (file-attributes
-                       (file-truename (expand-file-name target))))))))
-        
-        ;; Older than the oldest allowed?  Delete
-        (when (< mtime oldest)
-          (if buffer-snapshotter-notify
-              (message "buffer-snapshotter-cleanup-directory deleting: '%s'" target))
-          (delete-file target))))))
-                   
-  
+      ;; Run through the list.
+      (dolist (target whole-list)
+
+        (if (and (file-regular-p target)
+                 (file-readable-p target))
+            
+            ;; Calculate the mtime of the file-truename to get the real path
+            ;; and chase down symlinks and so forth and make sure to convert
+            ;; it back into a number.  There is probably a better way to do
+            ;; this I may be wasting my time with one of the conversions.
+            (let ((mtime (string-to-number
+                          (format-time-string
+                           "%s"
+                           (file-attribute-modification-time
+                            (file-attributes
+                             (file-truename (expand-file-name target))))))))
+              
+              ;; Older than the oldest allowed?  Delete
+              (when (< mtime oldest)
+                (if buffer-snapshotter-notify
+                    (message "buffer-snapshotter-cleanup-directory deleting: '%s'" target))
+                (delete-file target))))))))
+
+
 
 (defun buffer-snapshotter-delete-excess-by-number (&optional force-name)
   "Checks the 'buffer-snapshotter-directory' for snapshot files of
@@ -267,13 +405,13 @@ If the optional FORCE-NAME argument is set this is passed to
 If 'buffer-snapshotter-notify' is t then it will use (message) to
 log when it deletes a file."
   
-  (when (or (not (numberp buffer-snapshotter-keep-versions))
+  (when (or (not (cl-typep buffer-snapshotter-keep-versions 'integer))
             (not (>= buffer-snapshotter-keep-versions 1)))
     (error "buffer-snapshotter-delete-excess-by-number: buffer-snapshotter-keep-versions seems in error should be a number > 1"))
 
   ;; Find our list
   (let* ((snap-list (buffer-snapshotter--get-snapshot-list force-name)))
-                   
+    
     ;; If we have more than minimum then generate a butlast list and
     ;; delete them one by one
     (if (> (length snap-list) buffer-snapshotter-keep-versions)
@@ -296,7 +434,7 @@ If the optional FORCE-NAME argument is set this is passed to
 If 'buffer-snapshotter-notify' is t then it will use (message) to
 log when it deletes a file."
   
-  (when (or (not (numberp buffer-snapshotter-keep-time))
+  (when (or (not (cl-typep buffer-snapshotter-keep-time 'integer))
             (not (>= buffer-snapshotter-keep-time 1)))
     (error "buffer-snapshotter-delete-excess-by-time: buffer-snapshotter-keep-time seems in error should be a number > 1"))
 
@@ -323,7 +461,7 @@ log when it deletes a file."
               (message "buffer-snapshotter-delete-excess-by-time deleting: '%s'" target))
           (delete-file target))))))
 
-  
+
 
 (cl-defun buffer-snapshotter-save-copy (&optional force-name)
   "Attempts to save a snapshot of the file, if it hasn't changed or
@@ -483,9 +621,9 @@ If you want to activate it globally then add it to
 
         ;; Setup new one
         (setq-local buffer-snapshotter-timer
-                     (run-with-idle-timer buffer-snapshotter-frequency
-                                          t
-                                          #'buffer-snapshotter-save-copy))
+                    (run-with-idle-timer buffer-snapshotter-frequency
+                                         t
+                                         #'buffer-snapshotter-save-copy))
 
         (if buffer-snapshotter-force-frequency
             (setq-local buffer-snapshotter-force-timer
