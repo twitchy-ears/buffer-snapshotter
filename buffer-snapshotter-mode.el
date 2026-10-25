@@ -37,6 +37,9 @@
 ;; Essentially all you need is this:
 ;; (use-package buffer-snapshotter-mode)
 ;;
+;; It should be noted that by default this will not save snapshots of
+;; encrypted files.
+;;
 ;; Then M-x buffer-snapshotter-mode in a buffer you feel needs this mode.
 ;;
 ;; If you want it to clean up old files whenever you start Emacs then
@@ -59,14 +62,14 @@
 ;; TODO:
 ;;
 ;; Generally more testing.
-;; 
-;; Add variable for always keeping N copies of a document during cleanup.
+
 
 ;;; Code:
 
 (eval-and-compile
   (require 'seq)
   (require 'files)
+  (require 'disk-usage)
   (with-no-warnings (require 'cl-lib)))
 
 ;; Local variables
@@ -85,7 +88,7 @@
 
 (defvar buffer-snapshotter-force-frequency 600 "Seconds in non-idle timer before forcing a snapshot, if nil deactivates this behaviour")
 
-(defvar buffer-snapshotter-notify nil "When t will output a message when snapshotting a buffer")
+(defvar buffer-snapshotter-notify nil "When t many functions will output more verbosely into the message log.")
 
 (defvar buffer-snapshotter-include-hostname t
   "When t will include the hostname when using
@@ -121,19 +124,24 @@ will use 'buffer-snapshotter-keep-time' to determine which to
 delete.  If you point it to your own function you can make your
 own decisions.
 
-Similarly named function `buffer-snapshotter-cleanup-directory' is a
-function you can run on emacs startup to do a general sweep of snapshots,
-this is time based and configured seperately.")
+Similarly named functions `buffer-snapshotter-cleanup-directory' and
+`buffer-snapshotter-cleanup-directory-keep-minimum' are functions
+you can run on emacs startup to do a general sweep of existing on disk
+snapshots to keep them generally tidy")
 
-(defvar buffer-snapshotter-cleanup-directory-age 259200 "Age in seconds for a snapshot file to be kept, used by buffer-snapshotter-cleanup-directory to remove older files, default 3 days")
+(defvar buffer-snapshotter-cleanup-directory-age 259200
+  "Age in seconds for a snapshot file to be kept, default 3 days.  Used by the cleanup-directory functions.")
 
-;; TODO: Rework the snapshotter cleanup stuff to keep a last copy longer.
+(defvar buffer-snapshotter-cleanup-directory-keep-snapshots 1
+  "How many snapshots over the maximum age to keep around, used by
+`buffer-snapshotter-cleanup-directory-keep-minimum'")
 
-;; (defvar buffer-snapshotter-cleanup-directory-keep-snapshots 1 "How many snapshots over the maximum age to keep around, used by buffer-snapshotter-cleanup-directory")
+(defvar buffer-snapshotter-cleanup-directory-max-size (* 1024 100)
+  "Maximum size of the snapshots directory in kilobytes, default 100mb.
+Used by `buffer-snapshotter-cleanup-directory-by-size'")
 
-;; (defvar buffer-snapshotter-cleanup-directory-maximum-age 1814400 "Age in seconds for the retained snapshots to be kept, used by buffer-snapshotter-cleanup-directory")
-
-(defvar buffer-snapshotter-mode-after-hook nil "Hook that runs after the mode is turned on or off")
+(defvar buffer-snapshotter-mode-after-hook nil
+  "Hook that runs after the mode is turned on or off")
 
 (defvar buffer-snapshotter-save-copy-after-hook nil "Hook that runs after a succesful run of the 'buffer-snapshotter-save-copy' function where a new snapshot is made")
 
@@ -148,6 +156,12 @@ against both 'major-mode' and 'local-minor-modes', defaults to avoiding the mini
   #'buffer-snapshotter-never-activate-function-p
   "Function that runs before the mode is activated, if it returns t then the mode will not be activated.")
 
+(defvar buffer-snapshotter-force-snapshot-on-save
+  nil
+  "Set to t to force a snapshot to be written to disk whenever you save your buffer to disk.")
+
+
+
 
 ;;--- Functions ---
 
@@ -160,6 +174,15 @@ and returns t for this case."
   (let ((bfname (buffer-file-name)))
     (if bfname
         (epa-file-name-p bfname))))
+
+(defun buffer-snapshotter-save-on-buffer-save ()
+  "Optionally force a snapshot whenever the file is saved to disk.
+
+Designed to be attached to the `before-save-hook' and checks the
+`buffer-snapshotter-force-snapshot-on-save' variable, if that is true
+in some way it will save a snapshot."
+  (if buffer-snapshotter-force-snapshot-on-save
+      (buffer-snapshotter-save-copy nil t)))
 
 (defun buffer-snapshotter--string-safe (str)
   "Takes a string 'STR' and renders everything not matching the
@@ -269,12 +292,21 @@ If FORCE-NAME is given will use that to generate the name for searching for snap
              (>= current-prefix-arg 0))
         (setq countback current-prefix-arg)
       (setq countback 0)))        
-  
-  (let ((last-snapshot (expand-file-name (buffer-snapshotter-get-nth-from-last-snapshot countback force-name))))
-    (when (file-exists-p last-snapshot)
-      (diff last-snapshot (current-buffer) nil 'noasync))))
 
-(defun buffer-snapshotter-vdiff-buffer-last-snapshot (&optional countback force-name)
+  (let ((raw-snapshot-fn (buffer-snapshotter-get-nth-from-last-snapshot
+                          countback
+                          force-name)))
+
+    (when (not raw-snapshot-fn)
+      (error "No snapshot file based on countback and buffer (%i, %s)"
+             countback
+             force-name))
+  
+    (let ((last-snapshot (file-truename raw-snapshot-fn)))
+      (when (file-exists-p last-snapshot)
+        (diff last-snapshot (current-buffer) nil 'noasync)))))
+
+(cl-defun buffer-snapshotter-vdiff-buffer-last-snapshot (&optional countback force-name)
   "Displays a vdiff between the current buffer and its last snapshot file.
 
 If COUNTBACK is given (or the universal argument given) will go back that many snapshots and do the diff.
@@ -305,39 +337,47 @@ If FORCE-NAME is given will use that to generate the name for searching for snap
         (setq countback current-prefix-arg)
       (setq countback 0)))        
 
-  (let* ((last-snapshot (expand-file-name
-                         (buffer-snapshotter-get-nth-from-last-snapshot
+  (let ((raw-snapshot-fn (buffer-snapshotter-get-nth-from-last-snapshot
                           countback force-name)))
-         (active-buffer (current-buffer))
-         (ss-buffer nil))
-    
-    (when (file-exists-p last-snapshot)
 
-      ;; Name the buffer after the epoch in the filename if we find one
-      (let* ((ss-epoch (file-name-extension last-snapshot))
-             (ss-suffix (if ss-epoch
-                            ss-epoch
-                          "0")))
+    (when (not raw-snapshot-fn)
+      (error "No snapshot file based on countback and buffer (%i, %s)"
+             countback
+             force-name))
+  
+    (let* ((last-snapshot (file-truename
+                           (expand-file-name
+                            raw-snapshot-fn)))
+           (active-buffer (current-buffer))
+           (ss-buffer nil))
+      
+      (when (file-exists-p last-snapshot)
         
-        ;; Dump the snapshot into a temporary buffer
-        (setq ss-buffer
-              (get-buffer-create
-               (format "*buffer-snapshotter-mode-vdiff-buffer-last-snapshot-%s*" ss-suffix)))
-
-        (save-excursion
-          (switch-to-buffer ss-buffer)
-          (goto-char (point-min))
-          (insert-file last-snapshot))
-        
-        ;; Vdiff the buffers, but also put in a function to kill the temporary buffer upon use of vdiff-quit
-        (vdiff-buffers active-buffer
-                       ss-buffer
-                       t
-                       (lambda (actual-buff ss-buff)
-                         (kill-buffer ss-buff))
-                       t
-                       nil)))))
-
+        ;; Name the buffer after the epoch in the filename if we find one
+        (let* ((ss-epoch (file-name-extension last-snapshot))
+               (ss-suffix (if ss-epoch
+                              ss-epoch
+                            "0")))
+          
+          ;; Dump the snapshot into a temporary buffer
+          (setq ss-buffer
+                (get-buffer-create
+                 (format "*buffer-snapshotter-mode-vdiff-buffer-last-snapshot-%s*" ss-suffix)))
+          
+          (save-excursion
+            (switch-to-buffer ss-buffer)
+            (goto-char (point-min))
+            (insert-file last-snapshot))
+          
+          ;; Vdiff the buffers, but also put in a function to kill the temporary buffer upon use of vdiff-quit
+          (vdiff-buffers active-buffer
+                         ss-buffer
+                         t
+                         (lambda (actual-buff ss-buff)
+                           (kill-buffer ss-buff))
+                         t
+                         nil))))))
+  
 
 (defun buffer-snapshotter-cleanup-directory (&optional force-dir)
   "Runs through every file in the 'buffer-snapshotter-directory' and
@@ -391,6 +431,242 @@ dangerous."
                 (if buffer-snapshotter-notify
                     (message "buffer-snapshotter-cleanup-directory deleting: '%s'" target))
                 (delete-file target))))))))
+
+
+
+
+(defun buffer-snapshotter-cleanup-directory-keep-minimum (&optional target-dir max-age keep-number)
+  "Expires snapshot files based on age but also keeping a certain number
+
+It works through TARGET-DIR building a list of basenames of groups of
+ snapshot files.
+
+Each of these basenames is then passed to
+`buffer-snapshotter--process-cleanup-basename-list' which finds all the
+ associated files, sorts them by age, ignores the newest KEEP-NUMBER
+ from thatlist and tests the rest against MAX-AGE, deleting those that
+ are too old.
+
+This is so you can use a mix of this and
+ `buffer-snapshotter-cleanup-directory' to make sure you always keep 1-2
+ snapshots for a file, but also clean up those kept ones if they are
+ excessively old.
+
+TARGET-DIR defaults to the `buffer-snapshotter-directory'
+
+MAX-AGE defaults to the `buffer-snapshotter-cleanup-directory-age'
+
+KEEP-NUMBER defaults to `buffer-snapshotter-cleanup-directory-keep-snapshots'"
+
+  (interactive)
+
+  (if (or (not target-dir)
+          (not (file-accessible-directory-p target-dir)))
+      (setq target-dir buffer-snapshotter-directory))
+
+  (if (not max-age)
+      (setq max-age buffer-snapshotter-cleanup-directory-age))
+
+  (if (not keep-number)
+      (setq keep-number buffer-snapshotter-cleanup-directory-keep-snapshots))
+
+  ;; Build a list of basenames
+  (let* ((whole-list (directory-files target-dir t nil t))
+         (basename-list (make-hash-table :test 'equal)))
+
+    (dolist (target whole-list)
+      (when (file-regular-p target)
+        (let ((target-basename (file-name-base target)))
+          (if (not (gethash target-basename basename-list))
+              (puthash target-basename "yes" basename-list)))))
+
+    (if buffer-snapshotter-notify
+        (message "buffer-snapshotter-cleanup-directory-keep-minimum basename list: %s" (hash-table-keys basename-list)))
+
+    ;; Process through them
+    (maphash (lambda (basename val)
+               (buffer-snapshotter--process-cleanup-basename-list
+                basename
+                target-dir
+                max-age
+                keep-number))
+             basename-list)))
+
+(defun buffer-snapshotter--process-cleanup-basename-list (basename &optional target-dir max-age keep-number)
+  "Cleans snapshots associated with a basename keeping a configurable amount.
+
+Called by `buffer-snapshotter-cleanup-directory-keep-minimum' to clean
+ files.
+
+Takes a BASENAME which is used to construct a pattern to find the files
+ in TARGET-DIR (which defaults to `buffer-snapshotter-directory').
+
+It ignores the KEEP-NUMBER newest amount of these files, then judges the
+ rest based on MAX-AGE and removes any older than this many seconds.
+
+KEEP-NUMBER defaults to `buffer-snapshotter-cleanup-directory-keep-snapshots'
+
+MAX-AGE defaults to `buffer-snapshotter-cleanup-directory-age'"
+
+  (if (or (not target-dir)
+          (not (file-accessible-directory-p target-dir)))
+      (setq target-dir buffer-snapshotter-directory))
+  
+  (if (not max-age)
+      (setq max-age buffer-snapshotter-cleanup-directory-age))
+
+  (if (not keep-number)
+      (setq keep-number buffer-snapshotter-cleanup-directory-keep-snapshots))
+
+  ;; Build and sort our list
+  (let* ((file-matcher (format "%s\.[0-9]*$" basename))
+         (whole-list (cl-sort
+                      (directory-files-and-attributes target-dir
+                                                      t
+                                                      file-matcher
+                                                      t)
+                            #'time-less-p
+                            :key #'(lambda (x) (nth 6 x))))
+         (kept-files '())
+         (now (string-to-number (format-time-string "%s" (current-time))))
+         (oldest (- now max-age)))
+         
+
+    ;; Make a note of what we're tailing off the end of the list to
+    ;; definitely keep
+    (when (>= keep-number 1)
+      ;; (message "Removing %s elements" keep-number)
+      (setq kept-files (mapcar #'car (last whole-list keep-number)))
+      (setq whole-list (butlast whole-list keep-number)))
+
+    ;; Log kept files if the user is interested
+    (if buffer-snapshotter-notify
+        (message "buffer-snapshotter--process-cleanup-basename-list Ignoring '%i' files: %s" keep-number kept-files))
+
+    ;; Process everything left
+    (dolist (target whole-list)
+
+      ;; Convert the time object to an epoch
+      (let ((file-mtime (string-to-number
+                         (format-time-string "%s" (nth 6 target))))
+            (target-file (car target)))
+
+        ;; If older than the oldest allowed remove
+        (when (< file-mtime oldest)
+          (if buffer-snapshotter-notify
+              (message "buffer-snapshotter--process-cleanup-basename-list delete: file '%s'" target-file))
+          (delete-file target-file))))))
+
+
+
+(cl-defun buffer-snapshotter-cleanup-directory-by-size (&optional target-dir max-dir-size)
+  "Expires snapshot files based on size of directory
+
+It determines the size of TARGET-DIR and if it is larger than
+ MAX-DIR-SIZE it will start removing files starting with the oldest ones
+ until the size is under MAX-DIR-SIZE.
+
+TARGET-DIR defaults to the `buffer-snapshotter-directory'
+
+MAX-AGE defaults to the `buffer-snapshotter-cleanup-directory-max-size'.
+
+Relies on a functioning `disk-usage--directory-size-with-du'."
+
+  (interactive)
+
+  ;; Set directory if not already
+  (if (or (not target-dir)
+          (not (file-accessible-directory-p target-dir)))
+      (setq target-dir buffer-snapshotter-directory))
+
+  ;; Check we got a directory
+  (setq target-dir (file-truename (expand-file-name target-dir)))
+  (if (not (file-directory-p target-dir))
+      (cl-return-from buffer-snapshotter-cleanup-directory-by-size
+        (format "Not a directory '%s'" target-dir)))
+
+  ;; Set maximum directory size
+  (if (not max-dir-size)
+      (setq max-dir-size buffer-snapshotter-cleanup-directory-max-size))
+  (setq max-dir-size-bytes (* max-dir-size 1024))
+
+  ;; Work out the size of the directory
+  (let* ((disk-usage-du-args "-bs")
+        (disk-usage-directory-size-function
+         #'disk-usage-directory-size-with-du)
+        (target-size (funcall disk-usage-directory-size-function target-dir)))
+
+    ;; If we're under the size optionally notify the user and return early
+    (when (<= target-size max-dir-size-bytes)
+      
+      (if buffer-snapshotter-notify
+        (message "buffer-snapshotter NOT going to clean up '%s' because '%ik' in size <= '%ik' limit."
+                 target-dir
+                 (/ target-size 1024)
+                 max-dir-size))
+      
+      (cl-return-from buffer-snapshotter-cleanup-directory-by-size nil))
+    
+    ;; Otherwise run the cleanup
+    (when (> target-size max-dir-size-bytes)
+
+      (if buffer-snapshotter-notify
+          (message "buffer-snapshotter: Going to clean up '%s' because '%ik' directory size > '%ik' limit."
+                   target-dir
+                   (/ target-size 1024)
+                   max-dir-size))
+
+      ;; Gather up files by size and age
+      (let* ((saving-target (- target-size max-dir-size-bytes))
+             (saving-target-kilobytes (/ saving-target 1024))
+             (saved-running-count 0)
+             (whole-list (cl-sort
+                          (directory-files-and-attributes target-dir
+                                                          t
+                                                          nil
+                                                          t)
+                          #'time-less-p
+                          :key #'(lambda (x) (nth 6 x)))))
+
+        (if buffer-snapshotter-notify
+            (message "buffer-snapshotter: attempting to clean '%ik' of old snapshots" saving-target-kilobytes))
+
+        ;; Run through the potentials
+        (dolist (target whole-list)
+
+          ;; Gather up the files information
+          (let* ((filename (car target))
+                 (attribs (cdr target))
+                 (size-in-bytes (file-attribute-size attribs))
+                 (size-in-kb (/ size-in-bytes 1024))
+                 (file-mtime (format-time-string "%Y-%m-%d %H:%M:%S" (file-attribute-modification-time attribs))))
+
+            ;; Add to the amount we need
+            (when (file-regular-p filename)
+              
+                (if buffer-snapshotter-notify
+                    (message "buffer-snapshotter: deleting '%s', mtime '%s' size '%sb' (%skb)"
+                             filename
+                             file-mtime
+                             size-in-bytes
+                             size-in-kb))
+
+                ;; Add to the counter
+                (setq saved-running-count (+ saved-running-count size-in-bytes))
+
+                ;; Delete the file
+                (delete-file filename)
+
+                ;; Exit if we've hit our target
+                (when (>= saved-running-count saving-target)
+
+                  (if buffer-snapshotter-notify
+                      (message "buffer-snapshotter: Hit cleanup target for '%s' '%ib' removed >= '%ib' required"
+                               target-dir
+                               saved-running-count
+                               saving-target))
+
+                  (cl-return-from buffer-snapshotter-cleanup-directory-by-size t)))))))))
 
 
 
@@ -463,7 +739,7 @@ log when it deletes a file."
 
 
 
-(cl-defun buffer-snapshotter-save-copy (&optional force-name)
+(cl-defun buffer-snapshotter-save-copy (&optional force-name force-save)
   "Attempts to save a snapshot of the file, if it hasn't changed or
 buffer-snapshotter-mode isn't enabled then it returns.
 
@@ -483,17 +759,24 @@ Finally if a fresh snapshot is made it will run the
 anything yourself."
   (interactive)
 
-  ;; No change?  Bail
-  (when (or (not buffer-snapshotter-mode)
-            (equal buffer-snapshotter-bcmt (buffer-chars-modified-tick)))
-    (if buffer-snapshotter-mode
+  ;; If there's no change to the buffer and we're not being forced to
+  ;; do a write then bail on the function call early.
+  (unless force-save 
+    (when (or (not buffer-snapshotter-mode)
+              (equal buffer-snapshotter-bcmt (buffer-chars-modified-tick)))
+      (if buffer-snapshotter-mode
+          (cl-return-from buffer-snapshotter-save-copy
+            (format "No changes to save for %s because '%s' == '%s'"
+                    (buffer-name)
+                    buffer-snapshotter-bcmt
+                    (buffer-chars-modified-tick)))
         (cl-return-from buffer-snapshotter-save-copy
-          (format "No changes to save for %s because '%s' == '%s'"
-                  (buffer-name)
-                  buffer-snapshotter-bcmt
-                  (buffer-chars-modified-tick)))
-      (cl-return-from buffer-snapshotter-save-copy
-        (format "buffer-snapshotter not running in '%s'" (buffer-name)))))
+          (format "buffer-snapshotter not running in '%s'" (buffer-name))))))
+
+  ;; Make it clear that we're doing an unusual save
+  (if (and force-save
+           buffer-snapshotter-notify)
+      (message "buffer-snapshotter-save-copy: forced save starting"))
 
   ;; Calculate name and write out
   (let ((bs-filename (if force-name
@@ -629,7 +912,9 @@ If you want to activate it globally then add it to
             (setq-local buffer-snapshotter-force-timer
                         (run-with-timer buffer-snapshotter-force-frequency
                                         buffer-snapshotter-force-frequency
-                                        #'buffer-snapshotter-save-copy))))
+                                        #'buffer-snapshotter-save-copy)))
+
+        (add-hook 'before-save-hook 'buffer-snapshotter-save-on-buffer-save))
 
 
     ;; Turning off
@@ -644,6 +929,8 @@ If you want to activate it globally then add it to
     (setq-local buffer-snapshotter-base-name nil
                 buffer-snapshotter-bcmt nil
                 buffer-snapshotter-timer nil
-                buffer-snapshotter-force-timer nil)))
+                buffer-snapshotter-force-timer nil)
+
+    (remove-hook 'before-save-hook 'buffer-snapshotter-save-on-buffer-save)))
 
 (provide 'buffer-snapshotter-mode)
